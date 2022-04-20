@@ -56,6 +56,100 @@ static void register_packet_size(struct connection_map_key *connection, __u64 *p
     }
 }
 
+static bool parse_SNI(struct SNI_map_key *sni, void* tls_start, void* data_end) {
+    /* Parse payload */
+    struct tlshdr *tlshdr = tls_start;
+    if ((void*)tlshdr + sizeof(tlshdr) > data_end) {
+        return TC_ACT_OK;
+    }
+    /* Check that packet contains a TLS handshake client hello*/
+    if (tlshdr->content_type != TLS_HANDSHAKE_FLAG || tlshdr->handshake_type != TLS_HANDSHAKE_CLIENT_HELLO){
+        // __u64 packet_size = skb->len;
+        // register_packet_size(&connection_description, &packet_size);
+        // return TC_ACT_OK;
+        return false;
+    }
+    /* Skip useless bytes */
+    unsigned char *pointer = (void *)tlshdr + sizeof(struct tlshdr) + TLS_HANDSHAKE_CH_OFFSET;
+    if ((void*)pointer + sizeof(unsigned char) > data_end) {
+        return false;
+    }
+   pointer += sizeof(unsigned char) + *pointer;
+   uint16_t *ciph_len = (void *)pointer;
+   if ((void*)ciph_len + sizeof(uint16_t) > data_end) {
+        return false;
+    }
+   uint16_t ciph_len_val = bpf_ntohs(*ciph_len);
+    if (ciph_len_val > 512) { // Max size for ciph len, needed to keep the verifier happy
+        return false;
+    }
+   pointer += sizeof(uint16_t) + ciph_len_val;
+   if ((void*)pointer + sizeof(unsigned char) > data_end) {
+        return false;
+    }
+   pointer += sizeof(unsigned char) + *pointer + 2; // Skip the extension length
+
+    /* Find SNI */
+    uint16_t SNI_len = 0;
+    // Set array to 0
+    for (int i = 0; i < SNI_MAX_LEN; ++i) {
+        sni->SNI[i] = 0;
+    }
+    sni->SNI[SNI_MAX_LEN - 1] = '\0';
+    for (int i = 0; i < 50; ++i) {
+        /* Get extension type */
+        uint16_t *ext_type = (void *)pointer;
+        if ((void*)ext_type + sizeof(uint16_t) > data_end) {
+            return false;
+        }
+        uint16_t ext_type_val = bpf_ntohs(*ext_type);
+        /* Get extension length */
+        uint16_t *ext_len = (void *)pointer + sizeof(uint16_t);
+        if ((void*)ext_len + sizeof(uint16_t) > data_end) {
+            return false;
+        }
+        uint16_t ext_len_val = bpf_ntohs(*ext_len);
+        if (ext_len_val > 512) { // Max size for ext len, needed to keep the verifier happy
+            break;
+        }
+        /* Check if we found the SNI */
+        pointer += sizeof(uint16_t) + sizeof(uint16_t); // Skip past the extension headers
+        if (ext_type_val == TLS_SERVER_NAME_TYPE) {
+            pointer += 2; // Skip past the length of the SNI
+            unsigned char *server_type = (void *)pointer;
+            if ((void*)server_type + sizeof(unsigned char) > data_end) {
+                return false;
+            }
+            if (*server_type != TLS_SERVER_NAME_HOST_TYPE) {
+                return false;
+            }
+            pointer += sizeof(unsigned char);
+            uint16_t *sni_len_val = (void *)pointer;
+            if ((void*)sni_len_val + sizeof(uint16_t) > data_end) {
+                return false;
+            }
+            SNI_len = bpf_ntohs(*sni_len_val);
+            pointer += sizeof(uint16_t);
+            for (int i = 0; i < SNI_MAX_LEN - 1; ++i) {
+                if (i == SNI_len) {
+                    break;
+                }
+                unsigned char *sni_ = (void *)pointer;
+                if ((void*)sni_ + sizeof(unsigned char) > data_end) {
+                    return false;
+                }
+                sni->SNI[i] = *sni_;
+                pointer += sizeof(unsigned char);
+            }
+            break;
+        } else {
+            /* Skip extension */
+            pointer += ext_len_val;
+        }
+    }
+    return true;
+}
+
 
 SEC("xdp")
 int xdp_parse_ingress(struct xdp_md *ctx)
@@ -81,6 +175,10 @@ int xdp_parse_ingress(struct xdp_md *ctx)
     if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*tcph) > data_end) {
         return XDP_PASS;
     }
+    // Parse TLS header
+    void *tls_start;
+    unsigned char tcp_size = tcph->doff << 2;
+    tls_start = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + tcp_size;
     /* Create connection description */
     struct connection_map_key connection_description = {
         .port_src = bpf_ntohs(tcph->dest),
@@ -88,9 +186,16 @@ int xdp_parse_ingress(struct xdp_md *ctx)
         .ip_dst = iph->saddr,
         .ip_src = iph->daddr,
     };
-    /* Register packet size */
-    __u64 packet_size = ctx->data_end - ctx->data;
-    register_packet_size(&connection_description, &packet_size);
+
+    /* Parse payload */
+    struct SNI_map_key SNI_description;
+    if (!parse_SNI(&SNI_description, tls_start, data_end)){
+        __u64 packet_len = ctx->data_end - ctx->data;
+        register_packet_size(&connection_description,&packet_len);
+        return XDP_PASS;
+    }
+    // /* Create entry in map */
+    bpf_map_update_elem(&connections, &connection_description, &SNI_description, BPF_NOEXIST);
     return XDP_PASS;
 }
 
@@ -123,8 +228,6 @@ int tx_example(struct __sk_buff *skb){
         port_src = bpf_ntohs(tcp->source);
         /* Skipp TCP options */
         unsigned char tcp_size = tcp->doff << 2;
-        // Print packet info
-        bpf_printk("%d %d\n", port_src, port_dst);
         tls_start = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + tcp_size;
     } else if (ip->protocol == IPPROTO_UDP){
         /* TODO : Parsing QUIC packets */
@@ -148,98 +251,14 @@ int tx_example(struct __sk_buff *skb){
         .ip_src = ip->saddr,
     };
     /* Parse payload */
-    struct tlshdr *tlshdr = tls_start;
-    if ((void*)tlshdr + sizeof(tlshdr) > data_end) {
+    struct SNI_map_key SNI_description;
+    if (!parse_SNI(&SNI_description, tls_start, data_end)){
+        __u64 packet_len = skb->len;
+        register_packet_size(&connection_description,&packet_len);
         return TC_ACT_OK;
-    }
-    // bpf_printk("Reached point\n");
-    /* Check that packet contains a TLS handshake client hello*/
-    if (tlshdr->content_type != TLS_HANDSHAKE_FLAG || tlshdr->handshake_type != TLS_HANDSHAKE_CLIENT_HELLO){
-        __u64 packet_size = skb->len;
-        register_packet_size(&connection_description, &packet_size);
-        return TC_ACT_OK;
-    }
-    /* Skip useless bytes */
-    unsigned char *pointer = (void *)tlshdr + sizeof(struct tlshdr) + TLS_HANDSHAKE_CH_OFFSET;
-    if ((void*)pointer + sizeof(unsigned char) > data_end) {
-        return TC_ACT_OK;
-    }
-   pointer += sizeof(unsigned char) + *pointer;
-   uint16_t *ciph_len = (void *)pointer;
-   if ((void*)ciph_len + sizeof(uint16_t) > data_end) {
-        return TC_ACT_OK;
-    }
-   uint16_t ciph_len_val = bpf_ntohs(*ciph_len);
-    if (ciph_len_val > 512) { // Max size for ciph len, needed to keep the verifier happy
-        return TC_ACT_OK;
-    }
-   pointer += sizeof(uint16_t) + ciph_len_val;
-   if ((void*)pointer + sizeof(unsigned char) > data_end) {
-        return TC_ACT_OK;
-    }
-   pointer += sizeof(unsigned char) + *pointer + 2; // Skip the extension length
-
-    /* Find SNI */
-    uint16_t SNI_len = 0;
-    struct SNI_map_key sni_record;
-    // Set array to 0
-    for (int i = 0; i < SNI_MAX_LEN; ++i) {
-        sni_record.SNI[i] = 0;
-    }
-    sni_record.SNI[SNI_MAX_LEN - 1] = '\0';
-    for (int i = 0; i < 50; ++i) {
-        /* Get extension type */
-        uint16_t *ext_type = (void *)pointer;
-        if ((void*)ext_type + sizeof(uint16_t) > data_end) {
-            return TC_ACT_OK;
-        }
-        uint16_t ext_type_val = bpf_ntohs(*ext_type);
-        /* Get extension length */
-        uint16_t *ext_len = (void *)pointer + sizeof(uint16_t);
-        if ((void*)ext_len + sizeof(uint16_t) > data_end) {
-            return TC_ACT_OK;
-        }
-        uint16_t ext_len_val = bpf_ntohs(*ext_len);
-        if (ext_len_val > 512) { // Max size for ext len, needed to keep the verifier happy
-            break;
-        }
-        /* Check if we found the SNI */
-        pointer += sizeof(uint16_t) + sizeof(uint16_t); // Skip past the extension headers
-        if (ext_type_val == TLS_SERVER_NAME_TYPE) {
-            pointer += 2; // Skip past the length of the SNI
-            unsigned char *server_type = (void *)pointer;
-            if ((void*)server_type + sizeof(unsigned char) > data_end) {
-                return TC_ACT_OK;
-            }
-            if (*server_type != TLS_SERVER_NAME_HOST_TYPE) {
-                return TC_ACT_OK;
-            }
-            pointer += sizeof(unsigned char);
-            uint16_t *sni_len_val = (void *)pointer;
-            if ((void*)sni_len_val + sizeof(uint16_t) > data_end) {
-                return TC_ACT_OK;
-            }
-            SNI_len = bpf_ntohs(*sni_len_val);
-            pointer += sizeof(uint16_t);
-            for (int i = 0; i < SNI_MAX_LEN - 1; ++i) {
-                if (i == SNI_len) {
-                    break;
-                }
-                unsigned char *sni = (void *)pointer;
-                if ((void*)sni + sizeof(unsigned char) > data_end) {
-                    return TC_ACT_OK;
-                }
-                sni_record.SNI[i] = *sni;
-                pointer += sizeof(unsigned char);
-            }
-            break;
-        } else {
-            /* Skip extension */
-            pointer += ext_len_val;
-        }
     }
     // /* Create entry in map */
-    bpf_map_update_elem(&connections, &connection_description, &sni_record, BPF_NOEXIST);
+    bpf_map_update_elem(&connections, &connection_description, &SNI_description, BPF_NOEXIST);
     return TC_ACT_OK;
 }
 

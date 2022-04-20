@@ -11,6 +11,8 @@
 #include <csignal>
 #include "src/bpf/program.bpf.h"
 
+#define MICROSECONDS_PER_SEC 1000000
+
 using namespace boilerplate;
 using namespace bpf;
 
@@ -60,7 +62,6 @@ void gather_map_value(int fd, struct boilerplate::env *env)
     } else {
         printf("No output file specified, write to stdout\n");
     }
-
 	/* For percpu maps, userspace gets a value per possible CPU */
 	unsigned int nr_cpus = libbpf_num_possible_cpus();
     int num_keys = 0;
@@ -96,6 +97,19 @@ void gather_map_value(int fd, struct boilerplate::env *env)
     return;
 }
 
+void cleanup_hashmap(int map_fd){
+    // Get the number of keys
+    int num_keys = 0;
+    struct SNI_map_key keys[256];
+    get_keys(map_fd,&num_keys, keys);
+    // Delete the map entry
+    for (int i = 0; i < num_keys; i++)
+    {
+        bpf_map_delete_elem(map_fd, &keys[i]);
+    }
+    return;
+}
+
 int main(int argc, char **argv) {
     // Parse arguments
     struct boilerplate::env env;
@@ -125,19 +139,32 @@ int main(int argc, char **argv) {
     int sni_map_fd = bpf_map__fd(boilerplate::skel->maps.sni_sizes);
     if (sni_map_fd < 0) {
         err = -1;
-        fprintf(stderr, "Failed to get map fd\n");
+        fprintf(stderr, "Failed to get SNI sizes tracker map fd\n");
         cleanup(NULL);
     }
-
+    int connections = bpf_map__fd(boilerplate::skel->maps.connections);
+    if (connections < 0) {
+        err = -1;
+        fprintf(stderr, "Failed to get connections tracker map fd\n");
+        cleanup(NULL);
+    }
     /* Process events */
     boilerplate::exiting = false;
-    __int64_t sleep_time = env.interval * 1000000;
+    __int64_t sleep_time = env.interval * MICROSECONDS_PER_SEC;
+    // Usually, clean up the connection map once every 1 hour
+    int clean_interval = (3600 * MICROSECONDS_PER_SEC) / sleep_time;
+    printf("Clean interval: %d\n", clean_interval);
+    int i = 0;
     while (!boilerplate::exiting) {
         usleep(sleep_time);
         gather_map_value(sni_map_fd, &env);
+        if (i == clean_interval) {
+            cleanup_hashmap(connections);
+            i = 0;
+        }
+        i++;
     }
     gather_map_value(sni_map_fd, &env);
-
     /* Clean up */
     cleanup(NULL);
 

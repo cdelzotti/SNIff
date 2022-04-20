@@ -44,7 +44,7 @@ namespace bpf {
         }
         // /* Attach XDP */
         fd = bpf_program__fd(skel->progs.xdp_parse_ingress);
-        err = bpf_set_link_xdp_fd(env->interface, fd, XDP_FLAGS_SKB_MODE);
+        err = bpf_xdp_attach(env->interface, fd, XDP_FLAGS_SKB_MODE, 0);
         if (err) {
             fprintf(stderr, "Failed to attach XDP to interface\n");
             return err;
