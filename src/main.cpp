@@ -152,8 +152,8 @@ int main(int argc, char **argv) {
     boilerplate::exiting = false;
     __int64_t sleep_time = env.interval * MICROSECONDS_PER_SEC;
     // Usually, clean up the connection map once every 1 hour
-    int clean_interval = (3600 * MICROSECONDS_PER_SEC) / sleep_time;
-    printf("Clean interval: %d\n", clean_interval);
+    __u32 seconds_hour = 3600;
+    __u32 clean_interval = (seconds_hour * MICROSECONDS_PER_SEC) / sleep_time;
     int i = 0;
     while (!boilerplate::exiting) {
         usleep(sleep_time);
